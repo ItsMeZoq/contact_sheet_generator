@@ -1,0 +1,233 @@
+name: PR & Push → Google Chat
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+  push:
+    branches:
+      - "**"
+    tags-ignore:
+      - "**"
+
+jobs:
+  notify-chat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Google Chat message
+        uses: actions/github-script@v7
+        env:
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.INTERN_BOT }}
+        with:
+          script: |
+            const baseUrl = process.env.GOOGLE_CHAT_WEBHOOK_URL;
+            if (!baseUrl) {
+              core.setFailed("Missing GOOGLE_CHAT_WEBHOOK_URL secret");
+              return;
+            }
+
+            const eventName = context.eventName;
+            const repo = context.payload.repository.full_name;
+
+            async function postToChat(body, threadKey) {
+              const hookUrl = baseUrl + (baseUrl.includes('?') ? '&' : '?') + 'threadKey=' + encodeURIComponent(threadKey);
+              const res = await fetch(hookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json; charset=UTF-8' },
+                body: JSON.stringify(body)
+              });
+              const text = await res.text();
+              core.info(`Chat response: ${res.status} ${res.statusText} — ${text}`);
+              return { ok: res.ok, status: res.status, text };
+            }
+
+            function buildCard({ headerTitle, headerSubtitle, headerImageUrl, headerImageAltText, widgets, sectionHeader, collapsible=false, uncollapsibleWidgetsCount=0 }) {
+              return {
+                cardsV2: [
+                  {
+                    cardId: "gh-card-" + Date.now(),
+                    card: {
+                      header: {
+                        title: headerTitle,
+                        subtitle: headerSubtitle,
+                        imageUrl: headerImageUrl || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+                        imageType: "CIRCLE",
+                        imageAltText: headerImageAltText || "GitHub"
+                      },
+                      sections: [
+                        {
+                          header: sectionHeader || "Details",
+                          collapsible: collapsible,
+                          ...(collapsible ? { uncollapsibleWidgetsCount: uncollapsibleWidgetsCount } : {}),
+                          widgets: widgets
+                        }
+                      ]
+                    }
+                  }
+                ]
+              };
+            }
+
+            if (eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              const action = context.payload.action;
+              const merged = !!pr.merged;
+              const stateText = action === 'closed' ? (merged ? 'merged' : 'closed') : action.replace(/_/g, ' ');
+              const prNum = pr.number;
+              const title = pr.title;
+              const author = pr.user?.login || context.actor;
+              const baseRef = pr.base?.ref || '';
+              const headRef = pr.head?.ref || '';
+              const url = pr.html_url;
+
+              const widgets = [
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "PERSON" },
+                    topLabel: "Title",
+                    text: title,
+                    bottomLabel: `by ${author}`
+                  }
+                },
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "DESCRIPTION" },
+                    topLabel: "PR",
+                    text: `#${prNum}`
+                  }
+                },
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "BOOKMARK" },
+                    topLabel: "Action",
+                    text: stateText
+                  }
+                },
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "FILE_DOWNLOAD" },
+                    topLabel: "Branches",
+                    text: `${headRef} → ${baseRef}`
+                  }
+                },
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "STAR" },
+                    topLabel: "Draft",
+                    text: String(!!pr.draft)
+                  }
+                },
+                {
+                  buttonList: {
+                    buttons: [
+                      { text: "Open PR", onClick: { openLink: { url } } }
+                    ]
+                  }
+                }
+              ];
+
+              const payload = buildCard({
+                headerTitle: `Pull Request ${stateText}: #${prNum}`,
+                headerSubtitle: repo,
+                headerImageAltText: "GitHub PR",
+                widgets,
+                sectionHeader: "Pull Request"
+              });
+
+              const threadKey = `pr-${repo}-${prNum}`;
+              let res = await postToChat(payload, threadKey);
+              if (!res.ok) {
+                core.warning("Card post failed, sending plain text fallback.");
+                res = await postToChat({
+                  text: `PR ${stateText}: #${prNum} — ${title}\n${url}\n${repo}: ${headRef} → ${baseRef}`
+                }, threadKey);
+                if (!res.ok) core.setFailed(`Fallback also failed (${res.status}): ${res.text}`);
+              }
+              return;
+            }
+
+            if (eventName === 'push') {
+              const p = context.payload;
+              const ref = p.ref || "";
+              const branch = ref.replace(/^refs\/heads\//, '');
+              if (!branch) {
+                core.info("Non-branch push (probably tag). Skipping.");
+                return;
+              }
+              const forced = !!p.forced;
+              const pusher = p.pusher?.name || context.actor;
+              const compare = p.compare;
+              const commits = Array.isArray(p.commits) ? p.commits : [];
+              const head = p.after;
+              const before = p.before;
+              const repoUrl = p.repository.html_url;
+
+              const max = 5;
+              const shown = commits.slice(0, max);
+              const remaining = Math.max(0, commits.length - shown.length);
+              const commitLines = shown.map(c => {
+                const sha = (c.id || '').substring(0, 7);
+                const msg1 = (c.message || '').split('\n')[0];
+                const who = c.author?.name || 'unknown';
+                return `\`${sha}\` ${msg1} — ${who}`;
+              });
+              const latestText = commitLines.join('\n') + (remaining ? `\n…and ${remaining} more` : '');
+
+              const widgets = [
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "DESCRIPTION" },
+                    topLabel: "Branch",
+                    text: branch,
+                    bottomLabel: `${pusher}${forced ? " (force push)" : ""}`
+                  }
+                },
+                {
+                  decoratedText: {
+                    startIcon: { knownIcon: "BOOKMARK" },
+                    topLabel: "Commits",
+                    text: String(commits.length)
+                  }
+                },
+              ];
+
+              if (latestText.trim()) {
+                widgets.push({
+                  decoratedText: {
+                    startIcon: { knownIcon: "BOOKMARK" },
+                    topLabel: "Latest commits",
+                    text: latestText
+                  }
+                });
+              }
+
+              widgets.push({
+                buttonList: {
+                  buttons: [
+                    { text: "Compare", onClick: { openLink: { url: compare || `${repoUrl}/compare/${before}...${head}` } } },
+                    { text: "Repo", onClick: { openLink: { url: repoUrl } } }
+                  ]
+                }
+              });
+
+              const payload = buildCard({
+                headerTitle: `Push to ${branch}`,
+                headerSubtitle: repo,
+                headerImageAltText: "GitHub Push",
+                widgets,
+                sectionHeader: "Push"
+              });
+
+              const threadKey = `push-${repo}-${branch}`;
+              let res = await postToChat(payload, threadKey);
+              if (!res.ok) {
+                core.warning("Card post failed, sending plain text fallback.");
+                const summary = latestText || '(no commits listed)';
+                res = await postToChat({
+                  text: `Push to *${branch}* by ${pusher}\nCommits: ${commits.length}\n${compare || ''}\n${summary}`
+                }, threadKey);
+                if (!res.ok) core.setFailed(`Fallback also failed (${res.status}): ${res.text}`);
+              }
+              return;
+            }
+
+            core.info(`Unhandled event: ${eventName}`);
