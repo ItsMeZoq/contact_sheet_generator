@@ -51,7 +51,3 @@ class ContactSheet:
         sheet.save(output_path)
         print(f"Contact sheet saved: {output_path} ({self.n} images, grid {self.cols}x{self.rows})")
 
-
-# Пример использования
-cs = ContactSheet(r"C:\Users\Zoq\Documents\Python_D\contact_sheet_gntr\contact_2")
-cs.generate()
